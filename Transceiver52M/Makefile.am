@@ -34,8 +34,14 @@ endif
 
 if USRP1 
 AM_CPPFLAGS += $(USRP_CFLAGS)
-else
+endif
+
+if UHD 
 AM_CPPFLAGS += $(UHD_CFLAGS)
+endif
+
+if SOAPY 
+AM_CPPFLAGS += $(SOAPY_CFLAGS)
 endif
 
 rev2dir = $(datadir)/usrp/rev2
@@ -92,7 +98,14 @@ osmo_trx_LDADD = \
 if USRP1 
 libtransceiver_la_SOURCES += USRPDevice.cpp
 osmo_trx_LDADD += $(USRP_LIBS)
-else
+endif
+
+if UHD 
 libtransceiver_la_SOURCES += UHDDevice.cpp
 osmo_trx_LDADD += $(UHD_LIBS)
+endif
+
+if SOAPY 
+libtransceiver_la_SOURCES += SoapyDevice.cpp
+osmo_trx_LDADD += $(SOAPY_LIBS)
 endif

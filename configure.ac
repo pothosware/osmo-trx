@@ -63,9 +63,19 @@ AC_ARG_WITH(usrp1, [
         [enable USRP1 gnuradio based transceiver])
 ])
 
+AC_ARG_WITH(uhd, [
+    AS_HELP_STRING([--with-uhd],
+        [enable UHD based transceivers])
+])
+
 AC_ARG_WITH(singledb, [
     AS_HELP_STRING([--with-singledb],
         [enable single daughterboard use on USRP1])
+])
+
+AC_ARG_WITH(soapy, [
+    AS_HELP_STRING([--with-soapy],
+        [enable Soapy SDR based transceivers])
 ])
 
 AC_ARG_WITH(neon, [
@@ -91,7 +101,7 @@ AS_IF([test "x$with_usrp1" = "xyes"], [
     PKG_CHECK_MODULES(USRP, usrp >= 3.3)
 ])
 
-AS_IF([test "x$with_usrp1" != "xyes"],[
+AS_IF([test "x$with_uhd" = "xyes"],[
     PKG_CHECK_MODULES(UHD, uhd >= 003.004.000)
     AC_DEFINE(USE_UHD, 1, Define to 1 if using UHD)
 ])
@@ -100,10 +110,16 @@ AS_IF([test "x$with_singledb" = "xyes"], [
     AC_DEFINE(SINGLEDB, 1, Define to 1 for single daughterboard)
 ])
 
+AS_IF([test "x$with_soapy" = "xyes"], [
+    PKG_CHECK_MODULES(SOAPY, SoapySDR >= 0.1)
+])
+
 # Find and define supported SIMD extensions
 AX_EXT
 
 AM_CONDITIONAL(USRP1, [test "x$with_usrp1" = "xyes"])
+AM_CONDITIONAL(UHD, [test "x$with_uhd" = "xyes"])
+AM_CONDITIONAL(SOAPY, [test "x$with_soapy" = "xyes"])
 AM_CONDITIONAL(ARCH_ARM, [test "x$with_neon" = "xyes" || test "x$with_neon_vfpv4" = "xyes"])
 AM_CONDITIONAL(ARCH_ARM_A15, [test "x$with_neon_vfpv4" = "xyes"])
 
