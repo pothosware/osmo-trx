@@ -7,7 +7,33 @@
 #include "Threads.h"
 #include "Logger.h"
 #include <SoapySDR/Device.hpp>
+#include <SoapySDR/Logger.hpp>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <sched.h> //thread prio
 
+/***********************************************************************
+ * Device specific settings
+ **********************************************************************/
+struct DeviceSpecificSettings
+{
+    std::string key;
+    size_t sps;
+    double rxOffset; //rx adjustment in seconds
+    double clockRate; //non 0 to set master clock rate
+    bool sharedLo;
+    std::string desc;
+};
+
+static DeviceSpecificSettings settings[] = {
+    { "umtrx", 1, 9.9692e-5, 0.0, false, "UmTRX 1 SPS" },
+    { "umtrx", 4, 7.3846e-5, 0.0, false, "UmTRX 4 SPS" },
+};
+
+/***********************************************************************
+ * SoapyDevice overload
+ **********************************************************************/
 class SoapyDevice : public RadioDevice
 {
 public:
@@ -25,7 +51,10 @@ public:
   bool stop();
 
   /** Get the Tx window type */
-  enum TxWindowType getWindowType();
+  enum TxWindowType getWindowType()
+  {
+      return TX_WINDOW_FIXED;
+  }
 
   /** Enable thread priority */
   void setPriority(float prio);
@@ -56,7 +85,10 @@ public:
                            TIMESTAMP timestamp, bool isControl);
 
   /** Update the alignment between the read and write timestamps */
-  bool updateAlignment(TIMESTAMP timestamp);
+  bool updateAlignment(TIMESTAMP timestamp)
+  {
+      return true; //assume always aligned
+  }
 
   /** Set the transmitter frequency */
   bool setTxFreq(double wFreq, size_t chan);
@@ -65,16 +97,28 @@ public:
   bool setRxFreq(double wFreq, size_t chan);
 
   /** Returns the starting write Timestamp*/
-  TIMESTAMP initialWriteTimestamp(void);
+  TIMESTAMP initialWriteTimestamp(void)
+  {
+      return _initialTime * _sps;
+  }
 
   /** Returns the starting read Timestamp*/
-  TIMESTAMP initialReadTimestamp(void);
+  TIMESTAMP initialReadTimestamp(void)
+  {
+      return _initialTime;
+  }
 
   /** returns the full-scale transmit amplitude **/
-  double fullScaleInputValue();
+  double fullScaleInputValue()
+  {
+      return 32000*0.3;
+  }
 
   /** returns the full-scale receive amplitude **/
-  double fullScaleOutputValue();
+  double fullScaleOutputValue()
+  {
+      return 32000;
+  }
 
   /** sets the receive chan gain, returns the gain setting **/
   double setRxGain(double dB, size_t chan);
@@ -105,24 +149,100 @@ public:
   double numberWritten();
 
 private:
+    DeviceSpecificSettings _settings;
     SoapySDR::Device *_device;
     SoapySDR::Stream *_rxStream;
     SoapySDR::Stream *_txStream;
     std::vector<size_t> _chans;
-    double _sampRate;
+    const size_t _sps;
+    const bool _diversity;
+    const double _offset;
+
+    //stats
+    long long _numReadden;
+    long long _numWritten;
+
+    //rx time tracking
+    TIMESTAMP _initialTime;
+    TIMESTAMP _rxTicksOffset;
+    TIMESTAMP _nextRxTime;
+
+    //actual rates after setting sample rates
+    double _actualRxRate;
+    double _actualTxRate;
+
+    TIMESTAMP timeNsToRxTicks(const long long timeNs)
+    {
+        return TIMESTAMP(timeNs*(_actualRxRate/1e9));
+    }
+
+    long long txTicksToTimeNs(const TIMESTAMP ticks)
+    {
+        return ticks*(1e9/_actualTxRate);
+    }
 };
 
+/***********************************************************************
+ * Logger hooks
+ **********************************************************************/
+static void SoapyDevice_logger(const SoapySDR::LogLevel logLevel, const char *message)
+{
+    switch(logLevel)
+    {
+    case SOAPY_SDR_FATAL:    LOG(EMERG)   << message; break;
+    case SOAPY_SDR_CRITICAL: LOG(CRIT)    << message; break;
+    case SOAPY_SDR_ERROR:    LOG(ERR)     << message; break;
+    case SOAPY_SDR_WARNING:  LOG(WARNING) << message; break;
+    case SOAPY_SDR_NOTICE:   LOG(NOTICE)  << message; break;
+    case SOAPY_SDR_INFO:     LOG(INFO)    << message; break;
+    case SOAPY_SDR_DEBUG:    LOG(DEBUG)   << message; break;
+    case SOAPY_SDR_TRACE:    LOG(DEBUG)   << message; break;
+    }
+}
+
+/***********************************************************************
+ * thread prio
+ **********************************************************************/
+static std::string _setPriority(const double prio)
+{
+    //no negative priorities supported on this OS
+    if (prio <= 0.0) return "";
+
+    //determine priority bounds
+    const int policy(SCHED_RR);
+    const int maxPrio = sched_get_priority_max(policy);
+    if (maxPrio < 0) return strerror(errno);
+    const int minPrio = sched_get_priority_min(policy);
+    if (minPrio < 0) return strerror(errno);
+
+    //set realtime priority and prio number
+    struct sched_param param;
+    std::memset(&param, 0, sizeof(param));
+    param.sched_priority = minPrio + int(prio * (maxPrio-minPrio));
+    if (sched_setscheduler(0, policy, &param) != 0) return strerror(errno);
+
+    return "";
+}
+
+/***********************************************************************
+ * SoapyDevice implementation
+ **********************************************************************/
 SoapyDevice::SoapyDevice(size_t sps, size_t chans, bool diversity, double offset):
     _device(NULL),
     _rxStream(NULL),
     _txStream(NULL),
-    _sampRate(sps)
+    _sps(sps),
+    _diversity(diversity),
+    _offset(offset),
+    _numReadden(0),
+    _numWritten(0)
 {
     for (size_t i = 0; i < chans; i++) _chans.push_back(i);
 }
 
 SoapyDevice::~SoapyDevice(void)
 {
+    LOG(INFO) << "Cleanup SoapySDR device";
     if (_rxStream != NULL) _device->closeStream(_rxStream);
     if (_txStream != NULL) _device->closeStream(_txStream);
     SoapySDR::Device::unmake(_device);
@@ -130,19 +250,286 @@ SoapyDevice::~SoapyDevice(void)
 
 int SoapyDevice::open(const std::string &args, bool extref)
 {
+    LOG(INFO) << "Make SoapySDR device " << args;
     _device = SoapySDR::Device::make(args);
     if (extref) _device->setClockSource("EXTERNAL");
     _rxStream = _device->setupStream(SOAPY_SDR_RX, "CS16", _chans);
     _txStream = _device->setupStream(SOAPY_SDR_TX, "CS16", _chans);
+    LOG(INFO) << "Using " << _chans.size() << " channels";
+
+    //discover the settings
+    bool found = false;
+    _settings.clockRate = 0.0;
+    _settings.rxOffset = 0.0;
+    _settings.sharedLo = false;
+    for (size_t i = 0; i < sizeof(settings)/sizeof(DeviceSpecificSettings); i++)
+    {
+        if (strcasecmp(settings[i].key.c_str(), _device->getHardwareKey().c_str()) != 0) continue;
+        if (settings[i].sps != _sps) continue;
+        _settings = settings[i];
+        found = true;
+    }
+    if (not found)
+    {
+        LOG(ERR) << "No device specific settings match for " << _device->getHardwareKey();
+    }
+
+    //set the clock rate if specified
+    if (_settings.clockRate != 0.0)
+    {
+        LOG(INFO) << "setting the clock rate " << (_settings.clockRate/1e6) << " MHz";
+        _device->setMasterClockRate(_settings.clockRate);
+    }
+
+    //set the sample rate
+    const double sampleRate = GSMRATE * _sps;
     for (size_t i = 0; i < _chans.size(); i++)
     {
-        _device->setSampleRate(SOAPY_SDR_RX, _chans[i], _sampRate);
-        _device->setSampleRate(SOAPY_SDR_TX, _chans[i], _sampRate);
+        _device->setSampleRate(SOAPY_SDR_RX, _chans[i], sampleRate);
+        _device->setSampleRate(SOAPY_SDR_TX, _chans[i], sampleRate);
     }
+
+    _rxTicksOffset = sampleRate*_settings.rxOffset;
     return NORMAL;
 }
 
+bool SoapyDevice::start()
+{
+    LOG(INFO) << "Starting SoapySDR streams";
+    int ret = 0;
+    const long deltaNs = long(1e8/*100ms*/);
+    const long long timeStartNs = _device->getHardwareTime() + deltaNs;
+    _initialTime = this->timeNsToRxTicks(timeStartNs);
+    ret |= _device->activateStream(_rxStream, SOAPY_SDR_HAS_TIME, timeStartNs);
+    ret |= _device->activateStream(_txStream);
+    LOG(INFO) << "Started SoapySDR streams " << ret;
+    return ret == 0;
+}
+
+bool SoapyDevice::stop()
+{
+    LOG(INFO) << "Stopping SoapySDR streams";
+    int ret = 0;
+    ret |= _device->deactivateStream(_rxStream);
+    ret |= _device->deactivateStream(_txStream);
+    LOG(INFO) << "Stopped SoapySDR streams " << ret;
+    return ret == 0;
+}
+
+void SoapyDevice::setPriority(float prio)
+{
+    std::string result = _setPriority(prio);
+    if (result.empty()) return;
+    LOG(WARNING) << "failed set prio " << result;
+}
+
+int SoapyDevice::readSamples(std::vector<short *> &bufs, int len, bool *overrun,
+                          TIMESTAMP timestamp, bool *underrun,
+                          unsigned *RSSI)
+{
+    timestamp += _rxTicksOffset;
+    *overrun = false;
+    *underrun = false;
+    *RSSI = 0;
+
+    if (bufs.size() != _chans.size())
+    {
+        LOG(ERR) << "bufs.size() channel mismatch";
+        return -1;
+    }
+
+    //read until the buffer is filled up
+    size_t sampsTotal = 0;
+    while (sampsTotal < size_t(len))
+    {
+        int flags = 0;
+        long long timeNs;
+        void *rxbuffs[bufs.size()];
+        for (size_t i = 0; i < bufs.size(); i++) rxbuffs[i] = bufs[i] + sampsTotal*2;
+
+        //determine receive size to strip off the early samples
+        size_t numSampsStrip = (timestamp > _nextRxTime)?(timestamp-_nextRxTime):0;
+        size_t numSampsRx = std::min(len-sampsTotal, numSampsStrip);
+
+        //perform a receive
+        int ret = _device->readStream(_rxStream, rxbuffs, numSampsRx, flags, timeNs, long(1e5));
+        if (ret == SOAPY_SDR_TIMEOUT) return 0;
+        if (ret == SOAPY_SDR_OVERFLOW) continue;
+        if (ret < 0)
+        {
+            LOG(ERR) << "readStream ret=" << ret;
+            return 0;
+        }
+        _numReadden += ret;
+
+        //update concept of time whenever time is valid
+        if ((flags & SOAPY_SDR_HAS_TIME) != 0)
+        {
+            _nextRxTime = this->timeNsToRxTicks(timeNs);
+        }
+
+        //check if the timestamp is late
+        if (timestamp < _nextRxTime and sampsTotal == 0)
+        {
+            LOG(ERR) << "readStream late";
+            return 0;
+        }
+
+        //update next rx time
+        _nextRxTime += ret;
+
+        //update the number of samples accumulated (throw out early)
+        if (numSampsStrip != 0) sampsTotal = 0;
+        else sampsTotal += ret;
+    }
+
+    return sampsTotal;
+}
+
+int SoapyDevice::writeSamples(std::vector<short *> &bufs, int len, bool *underrun,
+                           TIMESTAMP timestamp, bool isControl)
+{
+    if (bufs.size() != _chans.size())
+    {
+        LOG(ERR) << "bufs.size() channel mismatch";
+        return -1;
+    }
+
+    *underrun = false;
+
+    //control packets not supported
+    if (isControl)
+    {
+        LOG(ERR) << "Control packets are not supported";
+        return 0;
+    }
+
+    //check for status messages (no timeout, non blocking)
+    {
+        size_t chanMask;
+        int flags = 0;
+        long long timeNs = 0;
+        int ret = _device->readStreamStatus(_txStream, chanMask, flags, timeNs, 0);
+        *underrun = (ret == SOAPY_SDR_UNDERFLOW);
+    }
+
+    //write until length exhausted
+    size_t sampsTotal = 0;
+    while (sampsTotal < size_t(len))
+    {
+        int flags = 0;
+        long long timeNs = 0;
+        const void *txbuffs[bufs.size()];
+
+        //load time on first tx
+        if (sampsTotal == 0)
+        {
+            flags = SOAPY_SDR_HAS_TIME;
+            timeNs = this->txTicksToTimeNs(timestamp);
+        }
+
+        //load buffer pointers
+        for (size_t i = 0; i < bufs.size(); i++) txbuffs[i] = bufs[i] + sampsTotal*2;
+        size_t numSampsTx = len-sampsTotal;
+
+        //perform sample write
+        int ret = _device->writeStream(_txStream, txbuffs, numSampsTx, flags, timeNs);
+
+        //handle result
+        if (ret < 0)
+        {
+            LOG(ERR) << "writeStream ret=" << ret;
+            return 0;
+        }
+        _numWritten += ret;
+        sampsTotal += ret;
+    }
+
+    return sampsTotal;
+}
+
+bool SoapyDevice::setTxFreq(double wFreq, size_t chan)
+{
+    //TODO when LO is shared, we need offset params
+    //see _settings.sharedLo
+    _device->setFrequency(SOAPY_SDR_TX, chan, wFreq);
+    return true;
+}
+
+bool SoapyDevice::setRxFreq(double wFreq, size_t chan)
+{
+    //TODO when LO is shared, we need offset params
+    _device->setFrequency(SOAPY_SDR_RX, chan, wFreq);
+    return true;
+}
+
+double SoapyDevice::setRxGain(double dB, size_t chan)
+{
+    _device->setGain(SOAPY_SDR_RX, chan, dB);
+    return this->getRxGain(chan);
+}
+
+double SoapyDevice::getRxGain(size_t chan)
+{
+    return _device->getGain(SOAPY_SDR_RX, chan);
+}
+
+double SoapyDevice::maxRxGain(void)
+{
+    return _device->getGainRange(SOAPY_SDR_RX, 0).maximum();
+}
+
+double SoapyDevice::minRxGain(void)
+{
+    return _device->getGainRange(SOAPY_SDR_RX, 0).minimum();
+}
+
+double SoapyDevice::setTxGain(double dB, size_t chan)
+{
+    _device->setGain(SOAPY_SDR_TX, chan, dB);
+    return _device->getGain(SOAPY_SDR_TX, chan);
+}
+
+double SoapyDevice::maxTxGain(void)
+{
+    return _device->getGainRange(SOAPY_SDR_TX, 0).maximum();
+}
+
+double SoapyDevice::minTxGain(void)
+{
+    return _device->getGainRange(SOAPY_SDR_TX, 0).minimum();
+}
+
+double SoapyDevice::getTxFreq(size_t chan)
+{
+    return _device->getFrequency(SOAPY_SDR_TX, chan);
+}
+
+double SoapyDevice::getRxFreq(size_t chan)
+{
+    return _device->getFrequency(SOAPY_SDR_RX, chan);
+}
+
+double SoapyDevice::getSampleRate()
+{
+    return _device->getSampleRate(SOAPY_SDR_RX, 0);
+}
+
+double SoapyDevice::numberRead()
+{
+    return _numReadden;
+}
+
+double SoapyDevice::numberWritten()
+{
+    return _numWritten;
+}
+
+/***********************************************************************
+ * Factory function
+ **********************************************************************/
 RadioDevice *RadioDevice::make(size_t sps, size_t chans, bool diversity, double offset)
 {
+    SoapySDR::registerLogHandler(SoapyDevice_logger);
     return new SoapyDevice(sps, chans, diversity, offset);
 }
