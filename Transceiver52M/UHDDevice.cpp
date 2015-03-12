@@ -793,7 +793,7 @@ void uhd_device::restart()
 	cmd.stream_now = false;
 	cmd.time_spec = uhd::time_spec_t(current.get_real_secs() + delay);
 
-	usrp_dev->issue_stream_cmd(cmd);
+	rx_stream->issue_stream_cmd(cmd);
 
 	flush_recv(1);
 }
@@ -832,7 +832,7 @@ bool uhd_device::stop()
 	uhd::stream_cmd_t stream_cmd =
 		uhd::stream_cmd_t::STREAM_MODE_STOP_CONTINUOUS;
 
-	usrp_dev->issue_stream_cmd(stream_cmd);
+	rx_stream->issue_stream_cmd(stream_cmd);
 
 	started = false;
 	return true;
@@ -1154,7 +1154,7 @@ double uhd_device::getRxFreq(size_t chan)
 bool uhd_device::recv_async_msg()
 {
 	uhd::async_metadata_t md;
-	if (!usrp_dev->get_device()->recv_async_msg(md))
+	if (!tx_stream->recv_async_msg(md))
 		return false;
 
 	// Assume that any error requires resynchronization
