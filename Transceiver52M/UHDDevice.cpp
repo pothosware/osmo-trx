@@ -795,23 +795,24 @@ void uhd_device::restart()
 
 	aligned = false;
 
-	try_again:
-	const uhd::time_spec_t t0 = uhd::time_spec_t::get_system_time();
-	uhd::time_spec_t current = usrp_dev->get_time_now();
-
-	uhd::stream_cmd_t cmd = uhd::stream_cmd_t::STREAM_MODE_START_CONTINUOUS;
-	cmd.stream_now = false;
-	cmd.time_spec = uhd::time_spec_t(current.get_real_secs() + delay);
-
-	rx_stream->issue_stream_cmd(cmd);
-	const uhd::time_spec_t t1 = uhd::time_spec_t::get_system_time();
-
-	//if there was a massive system stall, example RT prio on other threads
-	//the timestamps t0 and t1 can tell us if the issued time will be late
-	if ((t1-t0).get_real_secs() > delay)
+	const int ntries = 3;
+	for (size_t i = 0; i < ntries; i++)
 	{
-		LOG(ERR) << "uhd_device::restart() encountered massive stall";
-		goto try_again;
+		const uhd::time_spec_t t0 = uhd::time_spec_t::get_system_time();
+		uhd::time_spec_t current = usrp_dev->get_time_now();
+
+		uhd::stream_cmd_t cmd = uhd::stream_cmd_t::STREAM_MODE_START_CONTINUOUS;
+		cmd.stream_now = false;
+		cmd.time_spec = uhd::time_spec_t(current.get_real_secs() + delay);
+
+		rx_stream->issue_stream_cmd(cmd);
+		const uhd::time_spec_t t1 = uhd::time_spec_t::get_system_time();
+
+		//if there was a massive system stall, example RT prio on other threads
+		//the timestamps t0 and t1 can tell us if the issued time will be late
+		if ((t1-t0).get_real_secs() < delay) break;
+		LOG(ERR) << "uhd_device::restart() encountered massive stall:" << i;
+		if (i+1 == ntries) exit(-1);
 	}
 
 	flush_recv(1);
