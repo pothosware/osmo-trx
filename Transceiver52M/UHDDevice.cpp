@@ -377,6 +377,13 @@ void *async_event_loop(uhd_device *dev)
 	return NULL;
 }
 
+//print Streaming status indicators
+static void print_ssi(const std::string &msg)
+{
+	static const char *SSI_ENABLED = getenv("SSI_ENABLED");
+	if (SSI_ENABLED != NULL) std::cerr << msg << std::flush;
+}
+
 /* 
     Catch and drop underrun 'U' and overrun 'O' messages from stdout
     since we already report using the logging facility. Direct
@@ -395,6 +402,7 @@ void uhd_msg_handler(uhd::msg::type_t type, const std::string &msg)
 		LOG(ERR) << msg;
 		break;
 	case uhd::msg::fastpath:
+		print_ssi(msg);
 		break;
 	}
 }
