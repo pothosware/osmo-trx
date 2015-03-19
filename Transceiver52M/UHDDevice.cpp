@@ -805,7 +805,14 @@ void uhd_device::restart()
 		cmd.stream_now = false;
 		cmd.time_spec = uhd::time_spec_t(current.get_real_secs() + delay);
 
-		rx_stream->issue_stream_cmd(cmd);
+		try
+		{
+			rx_stream->issue_stream_cmd(cmd);
+		}
+		catch (const std::exception &ex)
+		{
+			LOG(ALERT) << "uhd_device::restart() issue_stream_cmd() threw: " << ex.what();
+		}
 		const uhd::time_spec_t t1 = uhd::time_spec_t::get_system_time();
 
 		//if there was a massive system stall, example RT prio on other threads
@@ -880,6 +887,7 @@ int uhd_device::check_rx_md_err(uhd::rx_metadata_t &md, ssize_t num_smpls)
 				return ERROR_UNRECOVERABLE;
 			}
 			err_count++;
+			return ERROR_TIMING;
 		case uhd::rx_metadata_t::ERROR_CODE_OVERFLOW:
 		case uhd::rx_metadata_t::ERROR_CODE_LATE_COMMAND:
 		case uhd::rx_metadata_t::ERROR_CODE_BROKEN_CHAIN:
