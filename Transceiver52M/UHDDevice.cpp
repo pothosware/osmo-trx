@@ -795,6 +795,13 @@ void uhd_device::restart()
 
 	aligned = false;
 
+	/* Recreate RX streamers */
+	uhd::stream_args_t stream_args("sc16");
+	for (size_t i = 0; i < chans; i++)
+		stream_args.channels.push_back(i);
+
+	rx_stream = usrp_dev->get_rx_stream(stream_args);
+
 	const int ntries = 3;
 	for (size_t i = 0; i < ntries; i++)
 	{
